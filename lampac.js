@@ -11,8 +11,12 @@
     }
 
     (function () {
-        var LAMPAC_DEBUG = true; // Включим отладку, чтобы видеть уведомления на экране
-        
+        // === НАСТРОЙКИ ===
+        // По умолчанию плагин использует адрес, откуда сам загружен, либо локальный балансер.
+        // Если ваш Lampac работает на другом IP/порту, укажите его ниже вместо '', например: 'http://192.168.1.50:8094'
+        var LAMPAC_BASE_URL = ''; 
+        var LAMPAC_DEBUG = false;
+
         function lampacDebug(tag, payload) {
             try {
                 var msg = '[lampac] ' + tag + (payload !== undefined ? ': ' + (typeof payload === 'string' ? payload : JSON.stringify(payload)) : '');
@@ -24,67 +28,94 @@
         }
 
         function prioritizeBalansers(balansers) {
+            if (!balansers || !Array.isArray(balansers)) return balansers;
             var priority = ['filmix', 'zetflix', 'rutubemovie', 'vkmovie'];
             return balansers.sort(function (a, b) {
-                var indexA = priority.indexOf(a.api);
-                var indexB = priority.indexOf(b.api);
+                var indexA = priority.indexOf(a.api || a.source);
+                var indexB = priority.indexOf(b.api || b.source);
                 if (indexA === -1) indexA = 99;
                 if (indexB === -1) indexB = 99;
                 return indexA - indexB;
             });
         }
 
-        function lampacProbeHost(url, timeout) {
-            return new Promise(function (resolve) {
-                var xhr = new XMLHttpRequest();
-                xhr.open('GET', url + '/online.js', true);
-                xhr.timeout = timeout || 3000;
-                var bytesReceived = 0;
-                xhr.onprogress = function (e) {
-                    if (e.loaded) {
-                        bytesReceived = e.loaded;
-                        if (bytesReceived > 40000) {
-                            xhr.abort();
-                            resolve(true);
-                        }
-                    }
-                };
-                xhr.onreadystatechange = function () {
-                    if (xhr.readyState === 4) {
-                        if (xhr.status >= 200 && xhr.status < 300) {
-                            resolve(true);
-                        } else {
-                            resolve(false);
-                        }
-                    }
-                };
-                xhr.onerror = function () { resolve(false); };
-                xhr.ontimeout = function () { resolve(false); };
-                xhr.send();
-            });
-        }
-
-        // Главная интеграция в Lampa
         function startPlugin() {
-            lampacDebug('init', 'Plugin loaded successfully');
+            lampacDebug('init', 'Lampac Core Plugin Loaded');
 
-            // Подписываемся на события Lampa
+            // Перехватываем событие открытия вкладки "Онлайн" в карточке фильма
             window.Lampa.Listener.follow('online', function (e) {
-                // Когда открывается вкладка "Онлайн"
-                if (e.type === 'start' && e.object && e.object.items) {
-                    lampacDebug('intercept', 'Sorting balancers...');
+                if (e.type === 'start') {
+                    lampacDebug('open', 'Online tab opened for: ' + (e.object ? e.object.title : 'unknown'));
                     
-                    // Вызываем вашу функцию сортировки балансеров
+                    // Если Lampa передала список источников, сортируем их по вашему приоритету
+                    if (e.object && e.object.items) {
+                        e.object.items = prioritizeBalansers(e.object.items);
+                    }
+                }
+                
+                if (e.type === 'ready' && e.object && e.object.items) {
+                    lampacDebug('ready', 'Balancers loaded and sorted');
                     e.object.items = prioritizeBalansers(e.object.items);
                 }
             });
+
+            // Интеграция кастомного парсера Lampac (добавление кнопки, если встроенный онлайн отключен)
+            if (window.Lampa.Component && !window.Lampa.Component.get('lampac')) {
+                window.Lampa.Component.add('lampac', function (object) {
+                    var comp = this;
+                    
+                    this.create = function () {
+                        this.activity.loader(true);
+                        
+                        // Определяем адрес сервера Lampac
+                        var host = LAMPAC_BASE_URL || (window.Utils ? window.Utils.protocol() : 'http:') + '//localhost:8094';
+                        var card = object.movie;
+                        var url = host + '/?id=' + card.id + '&imdb=' + (card.imdb_id  '') + '&tmdb=' + card.id + '&title=' + encodeURIComponent(card.title  card.name);
+                        
+                        lampacDebug('request', 'Fetching streams from: ' + url);
+
+                        // Делаем запрос к вашему Lampac за списком видео-файлов/балансеров
+                        var xhr = new XMLHttpRequest();
+                        xhr.open('GET', url, true);
+                        xhr.timeout = 10000;
+                        
+                        xhr.onload = function () {
+                            comp.activity.loader(false);if (xhr.status >= 200 && xhr.status < 300) {
+                                try {
+                                    var result = JSON.parse(xhr.responseText);
+                                    lampacDebug('response', 'Data received successfully');
+                                    
+                                    // Передаем результаты в интерфейс Lampa для отображения серий/качества
+                                    if (result && (result.channels  result.get  result.items)) {
+                                        // Сортируем полученные каналы перед выводом на экран
+                                        if (result.items) result.items = prioritizeBalansers(result.items);
+                                        comp.activity.render(result);
+                                    } else {
+                                        comp.activity.empty('Lampac: Видео не найдено');
+                                    }
+                                } catch (err) {
+                                    comp.activity.error('Ошибка обработки данных Lampac');
+                                }
+                            } else {
+                                comp.activity.error('Сервер Lampac вернул ошибку: ' + xhr.status);
+                            }
+                        };
+                        
+                        xhr.onerror = function () {
+                            comp.activity.loader(false);
+                            comp.activity.error('Не удалось связаться с сервером Lampac. Проверьте сеть или адрес.');
+                        };
+                        
+                        xhr.send();
+                    };
+                });
+            }
         }
 
-        // Проверяем, готова ли Lampa к моменту загрузки скрипта
+        // Запуск
         if (window.Lampa && window.Lampa.Listener) {
             startPlugin();
         } else {
-            // Если Lampa еще не загрузилась полностью, ждем её готовности
             window.addEventListener('lampa_ready', startPlugin);
         }
     })();
